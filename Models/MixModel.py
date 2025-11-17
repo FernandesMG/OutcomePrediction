@@ -12,6 +12,7 @@ from torchmetrics.regression import MeanAbsoluteError, R2Score, MeanAbsolutePerc
 from sklearn.metrics import roc_auc_score, f1_score, accuracy_score
 from torcheval.metrics.aggregation.auc import AUC
 from torcheval.metrics.toolkit import sync_and_compute
+from torch.optim import lr_scheduler
 from torch.optim.lr_scheduler import LambdaLR, SequentialLR, StepLR
 from sksurv.metrics import concordance_index_censored
 from monai.networks import nets
@@ -19,9 +20,6 @@ import inspect
 import os
 import csv
 import json
-import yaml
-from triton.language.semantic import reduction
-
 from Losses import loss as losses
 from Losses.loss import WeightedMSE, CrossEntropy, ConcordanceIndex, CoxPHLoss
 from Utils.Diagnostics import (test_loss_computation, get_lr, get_label, is_global_zero, save_mid_slices_for_batch,
@@ -46,20 +44,29 @@ class MixModel(LightningModule):
         loss_weights = config["MODEL"]["loss_weights"]
         self.loss_weights = torch.tensor(
             loss_weights if isinstance(loss_weights, list) else [loss_weights] * len(self.loss_fcns))
-        layers = ([config['MODEL']['classifier_in']] + config['MODEL']['classifier_config'] +
-                  [config['DATA']['n_classes']])
         self.loss_needs_events = [len(inspect.signature(f.forward).parameters) >= 3 for f in self.loss_fcns]
         pred_type = 'risk' if type(self.loss_fcns[0]) is CoxPHLoss else 'time'
-        self.classifier = nn.Sequential()
         if config['MODEL']['backbone'] in ['efficientnet', 'simpleCNN']:
-            self.classifier += nn.Sequential(nn.Identity())
-        else:
+            self.head = nn.Identity()
+        elif config['MODEL']['backbone'] == 'simpleCNNBackbone':
+            self.head = nn.Sequential()
+            fused_dim = config['MODEL']['backbone_out_c'] + config['MODEL']['tab_config'][-1]
+            layers = ([fused_dim] + config['MODEL']['head_config'] + [config['DATA']['n_classes']])
             for i in range(len(layers) - 1):
-                self.classifier += nn.Sequential(
+                self.head += nn.Sequential(
+                    nn.Linear(layers[i], layers[i + 1]),
+                    nn.SiLU()
+                ) if i + 1 < len(layers) - 1 else nn.Sequential(nn.Linear(layers[i], layers[i + 1]))  # if last layer, do not add nn.SiLu()
+        else:
+            layers = ([config['MODEL']['classifier_in']] + config['MODEL']['classifier_config'] +
+                      [config['DATA']['n_classes']])
+            self.head = nn.Sequential()
+            for i in range(len(layers) - 1):
+                self.head += nn.Sequential(
                     nn.Linear(layers[i], layers[i + 1]),
                     nn.Dropout(config['MODEL']['dropout_prob'])
                 )
-        self.classifier.apply(self.weights_init)
+        self.head.apply(self.weights_init)
         self.survival_prediction_mode = config['MODEL']['modes'][0]
         self.val_dict = dict()
         self.train_dict = dict()
@@ -81,8 +88,8 @@ class MixModel(LightningModule):
             self.validation_c_index = ConcordanceIndex(pred_type)
 
     def forward(self, data_dict):
-        features = torch.cat([self.module_dict[k](data_dict[k]) for k in self.module_dict if k in data_dict], dim=1)
-        prediction = self.classifier(features)
+        fused = torch.cat([self.module_dict[k](data_dict[k]) for k in self.module_dict if k in data_dict], dim=1)
+        prediction = self.head(fused)
         return prediction
 
     def get_loss_functions(self):
@@ -155,19 +162,19 @@ class MixModel(LightningModule):
             event=event)
         self.log("train_loss_step", loss, on_step=True, on_epoch=False, sync_dist=True)
         self.log("train_loss_epoch", loss, on_step=False, on_epoch=True, sync_dist=True)
-        loss_v = test_loss_computation(prediction, label, event, lf=self.config["MODEL"]["loss_functions"])
-        self._log_high_loss_csv(
-            prediction=prediction,
-            loss=loss,
-            loss_v=loss_v,
-            event=event,
-            data_dict=data_dict,
-            label=label,
-            batch_idx=batch_idx,
-            csv_path=str(Path(self.logger.log_dir) / "high_loss_steps_train.csv"),
-            specific_tag="",
-            # save_mid_slices=True,
-        )
+        # loss_v = test_loss_computation(prediction, label, event, lf=self.config["MODEL"]["loss_functions"])
+        # self._log_high_loss_csv(
+        #     prediction=prediction,
+        #     loss=loss,
+        #     loss_v=loss_v,
+        #     event=event,
+        #     data_dict=data_dict,
+        #     label=label,
+        #     batch_idx=batch_idx,
+        #     csv_path=str(Path(self.logger.log_dir) / "high_loss_steps_train.csv"),
+        #     specific_tag="",
+        #     save_mid_slices=False,
+        # )
         return {**copy.deepcopy(data_dict), **metrics, 'loss': loss}
 
     def on_train_epoch_end(self):
@@ -195,18 +202,18 @@ class MixModel(LightningModule):
             stage='train' if self.training else 'val',
             event=event)
         self.log("val_loss", loss, on_step=True, on_epoch=True, sync_dist=True)
-        loss_v = test_loss_computation(prediction, label, event, lf=self.config["MODEL"]["loss_functions"])
-        self._log_high_loss_csv(
-            prediction=prediction,
-            loss=loss,
-            loss_v=loss_v,
-            event=event,
-            data_dict=data_dict,
-            label=label,
-            batch_idx=batch_idx,
-            csv_path=str(Path(self.logger.log_dir) / "high_loss_steps_val.csv"),
-            save_mid_slices=False,
-        )
+        # loss_v = test_loss_computation(prediction, label, event, lf=self.config["MODEL"]["loss_functions"])
+        # self._log_high_loss_csv(
+        #     prediction=prediction,
+        #     loss=loss,
+        #     loss_v=loss_v,
+        #     event=event,
+        #     data_dict=data_dict,
+        #     label=label,
+        #     batch_idx=batch_idx,
+        #     csv_path=str(Path(self.logger.log_dir) / "high_loss_steps_val.csv"),
+        #     save_mid_slices=False,
+        # )
         return {**copy.deepcopy(data_dict), **metrics, 'loss': loss}
 
     def on_validation_epoch_end(self):
@@ -257,10 +264,12 @@ class MixModel(LightningModule):
             return (epoch + 1) / (warmup_epochs + 1) if epoch < warmup_epochs else 1.0
 
         opt_cls = getattr(torch.optim, self.config['MODEL']['optimizer'], torch.optim.Adam)
-        optimizer = opt_cls(self.parameters(), lr=self.config['MODEL']['learning_rate'])
+        opt_params = eval(self.config['MODEL']['opt_params'])
+        optimizer = opt_cls(self.parameters(), lr=self.config['MODEL']['learning_rate'], **opt_params)
         warmup_scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
-        decay_scheduler = StepLR(optimizer, step_size=self.config['MODEL']['lr_step_size'],
-                                 gamma=self.config['MODEL']['lr_gamma'])
+        scheduler = getattr(lr_scheduler, self.config['MODEL']['lr_scheduler'], dict())
+        scheduler_params = eval(self.config['MODEL']['lr_params'])
+        decay_scheduler = scheduler(optimizer, **scheduler_params)
         scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, decay_scheduler],
                                  milestones=[self.config['MODEL']['lr_warmup_epochs']])
         return {'optimizer': optimizer,
@@ -281,6 +290,7 @@ class MixModel(LightningModule):
             specific_tag: str = None,
             include_ct_slices_json: bool = False,
             include_dose_slices_json: bool = False,
+            include_struct_slices_json: bool = False,
             save_mid_slices: bool = False,
     ):
         """Append one row with diagnostics for the current step (rank-0 only)."""
@@ -344,15 +354,17 @@ class MixModel(LightningModule):
         # ---- NEW: Save mid-slices (expects Image shape [B, 2, D1, D2, D3]) ----
         ct_slices_json = None
         dose_slices_json = None
+        struct_slices_json = None
         if torch.is_tensor(img) and img.ndim == 5 and img.size(1) >= 2:
             # Directory to store images next to the CSV
             base_dir = os.path.dirname(csv_path) or "."
             slice_dir = os.path.join(base_dir, "slices")
             tag = f"ep{epoch}_gs{global_step}_b{batch_idx}" if specific_tag is None else specific_tag
             if save_mid_slices:
-                ct_list, dose_list = save_mid_slices_for_batch(img, slice_dir, tag, slabels)
+                ct_list, dose_list, struct_list = save_mid_slices_for_batch(img, slice_dir, tag, slabels)
                 ct_slices_json = json.dumps(ct_list) if include_ct_slices_json else ""
                 dose_slices_json = json.dumps(dose_list) if include_dose_slices_json else ""
+                struct_slices_json = json.dumps(struct_list) if include_struct_slices_json and img.shape[1] == 3 else ""
 
         row = {
             "epoch": epoch,
@@ -397,6 +409,7 @@ class MixModel(LightningModule):
         if save_mid_slices:  # NEW: file paths to the saved mid-slice JPEGs (JSON arrays)
             row["ct_mid_slices"] = ct_slices_json
             row["dose_mid_slices"] = dose_slices_json
+            row["struct_mid_slices"] = struct_slices_json
 
         write_header = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
         with open(csv_path, mode="a", newline="") as f:
@@ -404,3 +417,4 @@ class MixModel(LightningModule):
             if write_header:
                 writer.writeheader()
             writer.writerow(row)
+

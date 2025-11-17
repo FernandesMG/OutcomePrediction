@@ -68,7 +68,6 @@ class DataGenerator(torch.utils.data.Dataset):
             RTDOSEPath = self.SubjectList.loc[i, 'RTDOSE_Path']
             RTDOSEPath = Path(RTDOSEPath, 'Dose.nii.gz')
             data['RTDOSE'] = LoadImage(image_only=True)(RTDOSEPath)
-            data['RTDOSE'] = data['RTDOSE']
 
         ## Load PET
         if 'PET' in self.keys and self.config['MODALITY']['PET']:
@@ -120,11 +119,96 @@ class DataGenerator(torch.utils.data.Dataset):
                 return (data, label, i) if self.predict else (data, label, i)
 
 
+class DataGeneratorReconstruction(torch.utils.data.Dataset):
+    def __init__(self, SubjectList, config=None, keys=('CT',), transform=None, inference=False, clinical_cols=None,
+                 predict=False):
+        super().__init__()
+        self.config = config
+        self.SubjectList = SubjectList
+        self.keys = [k for k in keys if config['MODALITY'][k]]
+        self.label_keys = self.config['DATA']['reconstruction_target']
+        self.transform = transform
+        self.inference = inference
+        self.clinical_cols = clinical_cols
+        self.predict = predict
+        self.n = 0
+        self.times = []
+
+    def __len__(self):
+        return int(self.SubjectList.shape[0])
+
+    def __getitem__(self, i):
+        data = {}
+        data['slabel'] = self.SubjectList.loc[i, self.config['DATA']['subject_label']]
+        ## Load CT
+        if 'CT' in self.keys or 'CT' in self.label_keys:
+            CTPath = self.SubjectList.loc[i, 'CT_Path']
+            CT_Path = Path(CTPath, 'CT.nii.gz')
+            ct = LoadImage(image_only=True, reader='ITKReader')(CT_Path)
+            if 'CT' in self.keys:
+                data['CT'] = ct
+            if 'CT' in self.label_keys:
+                data['CT_target'] = ct
+
+        ## Load RTDOSE
+        if 'RTDOSE' in self.keys or 'RTDOSE' in self.label_keys:
+            RTDOSEPath = self.SubjectList.loc[i, 'RTDOSE_Path']
+            RTDOSEPath = Path(RTDOSEPath, 'Dose.nii.gz')
+            dose = LoadImage(image_only=True)(RTDOSEPath)
+            if 'RTDOSE' in self.keys:
+                data['RTDOSE'] = dose
+            if 'RTDOSE' in self.label_keys:
+                data['RTDOSE_target'] = dose
+
+        ## Load PET
+        if 'PET' in self.keys or 'PET' in self.label_keys:
+            PETPath = self.SubjectList.loc[i, 'PET_Path']
+            if self.config['DATA']['Nifty']:
+                PETPath = Path(PETPath, 'pet.nii.gz')
+            pet = LoadImage(image_only=True)(PETPath)
+            if 'PET' in self.keys:
+                data['PET'] = pet
+            if 'PET' in self.label_keys:
+                data['PET_target'] = pet
+
+        ## Load Mask
+        if 'RTSTRUCT' in self.keys or 'RTSTRUCT' in self.label_keys:
+            RSPath = self.SubjectList.loc[i, 'RTSTRUCT_Path']
+            RS_Path = Path(RSPath, self.config['DATA']['structs'] + '.nii.gz')
+            struct = LoadImage(image_only=True)(RS_Path)
+            struct[struct>0] = 1
+            if 'RTSTRUCT' in self.keys:
+                data['RTSTRUCT'] = struct
+            if 'RTSTRUCT' in self.label_keys:
+                data['RTSTRUCT_target'] = struct
+
+        # Add clinical record at the end
+        if ('RECORDS' in self.config.keys() and self.config['RECORDS']['records']) or 'RECORDS' in self.label_keys:
+            records = self.SubjectList.loc[i, self.clinical_cols].values.astype('float')
+            if 'RECORDS' in self.keys:
+                data['records'] = records
+            if 'RECORDS' in self.label_keys:
+                data['records_target'] = records
+
+        if self.transform:
+            data = self.transform(data)
+
+        data['Image'] = np.concatenate([data[key] for key in self.keys], axis=0)
+        label = np.concatenate([data[f'{key}_target'] for key in self.label_keys], axis=0)
+        for key in self.keys+[f'{k}_target' for k in self.label_keys]:
+            data.pop(key)
+
+        if self.inference:
+            return data
+        else:
+            return data, label
+
+
 # DataLoader
 class DataModule(LightningDataModule):
     def __init__(self, SubjectList, config=None, train_transform=None, val_transform=None, train_size=0.7,
                  train_fraction=1., rd=None, rd_worker=None, num_workers=1, prefetch_factor=None, split_list=None,
-                 **kwargs):
+                 reconstruction=False, **kwargs):
         super().__init__()
         self.batch_size = config['MODEL']['batch_size']
         self.num_workers = num_workers
@@ -147,19 +231,21 @@ class DataModule(LightningDataModule):
         self.full_list = SubjectList.reset_index(drop=True)
 
         # scale targets
-        self.target_preprocessing = dict()
-        for i, col in enumerate([config['DATA']['target']] + config['DATA']['additional_targets']):
-            t_preproc = RobustScaler() if config['MODEL']['modes'][i] == 'regression' else MinMaxScaler()
-            self.train_list.loc[:, [col]] = t_preproc.fit_transform(self.train_list.loc[:, [col]]).astype(np.float32)
-            self.val_list.loc[:, [col]] = t_preproc.transform(self.val_list.loc[:, [col]]).astype(np.float32)
-            self.test_list.loc[:, [col]] = t_preproc.transform(self.test_list.loc[:, [col]]).astype(np.float32)
-            self.full_list.loc[:, [col]] = t_preproc.transform(self.full_list.loc[:, [col]]).astype(np.float32)
-            self.target_preprocessing[col] = t_preproc
+        if not reconstruction:
+            self.target_preprocessing = dict()
+            for i, col in enumerate([config['DATA']['target']] + config['DATA']['additional_targets']):
+                t_preproc = RobustScaler() if config['MODEL']['modes'][i] == 'regression' else MinMaxScaler()
+                self.train_list.loc[:, [col]] = t_preproc.fit_transform(self.train_list.loc[:, [col]]).astype(np.float32)
+                self.val_list.loc[:, [col]] = t_preproc.transform(self.val_list.loc[:, [col]]).astype(np.float32)
+                self.test_list.loc[:, [col]] = t_preproc.transform(self.test_list.loc[:, [col]]).astype(np.float32)
+                self.full_list.loc[:, [col]] = t_preproc.transform(self.full_list.loc[:, [col]]).astype(np.float32)
+                self.target_preprocessing[col] = t_preproc
 
-        self.train_data = DataGenerator(self.train_list, config=config, transform=train_transform, **kwargs)
-        self.val_data = DataGenerator(self.val_list, config=config, transform=val_transform, **kwargs)
-        self.test_data = DataGenerator(self.test_list, config=config, transform=val_transform, **kwargs)
-        self.full_data = DataGenerator(self.full_list, config=config, transform=val_transform, predict=True, **kwargs)
+        data_generator = DataGeneratorReconstruction if reconstruction else DataGenerator
+        self.train_data = data_generator(self.train_list, config=config, transform=train_transform, **kwargs)
+        self.val_data = data_generator(self.val_list, config=config, transform=val_transform, **kwargs)
+        self.test_data = data_generator(self.test_list, config=config, transform=val_transform, **kwargs)
+        self.full_data = data_generator(self.full_list, config=config, transform=val_transform, predict=True, **kwargs)
 
         self.train_sampler = RandomSampler(self.train_data, generator=self.generator)
 
@@ -209,20 +295,8 @@ class DataModule(LightningDataModule):
     @staticmethod
     def _random_split_(subject_list, train_size, rd):
         train_list, val_test_list = train_test_split(subject_list, train_size=train_size, random_state=rd)  ## 0.7/0.3
-        val_list, test_list = train_test_split(val_test_list, train_size=0.5, random_state=rd)  ## 0.15/0.15
-        return train_list, val_list, test_list
-
-    def _cv_(self, subject_list, train_size, k, fold, rd):
-        train_list, val_list, test_list = self._random_split_(subject_list, train_size, rd)
-        full_train = pd.concat([train_list, val_list], axis=0)
-        k_splitter = KFold(k, shuffle=True, random_state=rd)
-        k_folds = list(k_splitter.split(full_train))
-        return full_train.iloc[k_folds[fold][0]], full_train.iloc[k_folds[fold][1]], test_list
-
-    @staticmethod
-    def _random_split_(subject_list, train_size, rd):
-        train_list, val_test_list = train_test_split(subject_list, train_size=train_size, random_state=rd)  ## 0.7/0.3
-        val_list, test_list = train_test_split(val_test_list, train_size=0.5, random_state=rd)  ## 0.15/0.15
+        # val_list, test_list = train_test_split(val_test_list, train_size=0.5, random_state=rd)  ## 0.15/0.15  TODO: TRAIN SIZE IS TO BE PUT BACK TO 0.5!!!
+        val_list, test_list = val_test_list, val_test_list
         return train_list, val_list, test_list
 
     @staticmethod

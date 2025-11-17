@@ -15,10 +15,11 @@ from pytorch_lightning.profilers import SimpleProfiler, AdvancedProfiler, PyTorc
 ## Module - Dataloaders
 from DataGenerator.DataGenerator import DataModule
 from Models.Classifier import Classifier
-from Models.MLPs import TabMLP
+from Models.Linear import Linear
 from Models.MixModel import MixModel
+from Models.ResUnetImplemented import ResUNetImplemented
 from Utils.DataExtraction import create_subject_list
-from Utils.Transformations import transform_pipeline
+from Utils.Transformations import reconstruction_transform_pipeline
 from Utils.Callbacks import get_callbacks
 from Utils.ProcessResults import inverse_transform_target, get_results_table, get_train_val_test_tab
 
@@ -71,7 +72,6 @@ class GetTrainer(object):
         trainer = Trainer(**self.kwargs)
         return trainer
 
-
 def build_model(config):
     module_dict = nn.ModuleDict()
     clinical_cols = config['DATA']['clinical_cols']
@@ -86,10 +86,9 @@ def build_model(config):
                     module_dict.pop('RTSTRUCT')
 
     if 'RECORDS' in config.keys() and config['RECORDS']['records']:
-        module_dict['records'] = TabMLP(len(clinical_cols), config['MODEL']['tab_config'],
-                                        p=config['MODEL']['dropout_prob_tab'])
-        # module_dict['records'] = Linear(config, in_feat=len(clinical_cols),
-        #                                 out_feat=config['MODEL']['linear_out']
+        module_dict['records'] = Linear(config, in_feat=len(clinical_cols),
+                                        out_feat=config['MODEL']['linear_out'])
+
     return module_dict
 
 
@@ -140,12 +139,8 @@ def main(config, rd):
     SubjectList.to_csv(Path(config['DATA']['log_folder'])/'data_table.csv', index=False)
     clinical_cols = config['DATA']['clinical_cols']
     logger = get_logger(config['DATA']['log_folder'], config['DATA']['model_name'])
-    train_transform, val_transform = transform_pipeline(config, rd)
-    module_dict = build_model(config)
-    model = MixModel(module_dict, config)
-    # model.apply(model.weights_reset)
-    # ndarrays = get_parameters(model)
-    # print(f'PARAMETERS SHAPE: {ndarrays[0][0]}')
+    train_transform, val_transform = reconstruction_transform_pipeline(config, rd)
+    model = ResUNetImplemented(config)
     dataloader_getter = GetDataLoader(subject_list=SubjectList,
                                       config=config,
                                       keys=config['MODALITY'].keys(),
@@ -153,9 +148,10 @@ def main(config, rd):
                                       val_transform=val_transform,
                                       train_fraction=config['RUN']['train_fraction'],
                                       clinical_cols=clinical_cols,
+                                      inference=False,
+                                      reconstruction=True,
                                       rd=np.int16(rd),
                                       rd_worker=np.int16(config['RUN']['random_state_dataloader']),
-                                      inference=False,
                                       num_workers=10,
                                       prefetch_factor=5,
                                       )
@@ -199,13 +195,12 @@ def main(config, rd):
                  'best_main_target': list((Path(logger[0].log_dir) / 'checkpoints').glob('*best_main_target.ckpt'))[-1]}
     # ckpt_dict = {'lowest_val_loss': list((Path(log_dir) / 'checkpoints').glob('*best_model_round*'))[-1]}
     infer_and_save_results(ckpt_dict, logger[0].log_dir, config, model, trainer_getter(), dataloader,
-                           module_dict=module_dict)
+                           module_dict=model)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run training with optional config overrides.")
-    default_filename = "OPConfigurationSurvivalPredictionSimpleCNNWClinc.ini"  # 'OPConfigurationMultivariatePredictionEfficientNetDosimetricSurvival.ini' "OPConfigurationSurvivalPredictionEfficientNetFedComparison.ini"
-    parser.add_argument('--config', type=str, default=default_filename, help="Path to config file")
+    parser.add_argument('--config', type=str, default="OPConfigurationReconstructionResUnet.ini", help="Path to config file")
     parser.add_argument('--set', nargs='*', help="Override config values, e.g., --set RUN.random_state=42 DATA.model_name=CustomModel")
     args = parser.parse_args()
 

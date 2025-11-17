@@ -8,6 +8,8 @@ import torchmetrics
 from monai.networks import blocks, nets
 #from .UnetEncoder import UnetEncoder
 #from .PretrainedEncoder3D import PretrainedEncoder3D
+from .SimpleCNNs import SimpleCNNTest8 as SimpleCNN
+from .SimpleCNNs import SimpleCNNBackboneTest1 as SimpleCNNBackbone
 import os
 from totalsegmentator.python_api import totalsegmentator
 from copy import deepcopy
@@ -22,6 +24,8 @@ class Classifier(LightningModule):
     def __init__(self, config, module_str):
         super().__init__()
         self.config = config
+        self.w_init = self.config['MODEL']['w_init']
+        assert self.w_init in ['xavier', 'kaiming']
         self.backbone_fixed = config['MODEL']['backbone_fixed']
         model = config['MODEL']['backbone']
         parameters = config['MODEL_PARAMETERS']
@@ -62,21 +66,12 @@ class Classifier(LightningModule):
             layers = list(encoder.children())
             self.model = nn.Sequential(*layers)
         elif model == 'simpleCNN':
-            self.backbone = nn.Sequential(
-                nn.Conv3d(2, 8, kernel_size=3, padding=1),
-                nn.ReLU(),
-                nn.MaxPool3d(2),
-
-                nn.Conv3d(8, 16, kernel_size=3, padding=1),
-                nn.ReLU(),
-                nn.MaxPool3d(2),
-
-                nn.Conv3d(16, 32, kernel_size=3, padding=1),
-                nn.ReLU(),
-                nn.AdaptiveAvgPool3d(1),  # (B, 32, 1, 1, 1)
-                nn.Flatten(),             # (B, 32)
-                nn.Linear(32, 1),         # (B, 1)
-            )
+            self.backbone = SimpleCNN(self.config['DATA']['n_channel'], self.config['DATA']['n_classes'], config).model
+            self.model = self.backbone
+        elif model == 'simpleCNNBackbone':
+            self.backbone = SimpleCNNBackbone(self.config['DATA']['n_channel'],
+                                              config['MODEL']['backbone_out_c'],
+                                              config).model
             self.model = self.backbone
         elif model == 'efficientnet':
             self.backbone = EfficientNetBN(  # nets.EfficientNetBN("efficientnet-b0",
@@ -86,6 +81,8 @@ class Classifier(LightningModule):
                 num_classes=self.config['DATA']['n_classes'],
                 pretrained=self.config['MODEL']['pretrained'],  # added for testing
                 dropout_rate=self.config['MODEL']['dropout_prob'] if 'dropout_prob' in self.config['MODEL'] else None,
+                dropconnect_rate=self.config['MODEL']['dropout_prob'] if 'dropout_prob' in self.config[
+                    'MODEL'] else None,
                 )
             self.model = self.backbone
         else:
@@ -98,29 +95,32 @@ class Classifier(LightningModule):
             self.model.requires_grad_(False)
             self.model.train(False)
 
-        self.flatten = nn.Sequential(
-            nn.Dropout(config['MODEL']['dropout_prob']),
-            nn.AdaptiveAvgPool3d(output_size=config['MODEL']['bottleneck']),
-            nn.Flatten(),
-            nn.Dropout(config['MODEL']['dropout_prob']),
-            nn.Linear(
-                config['MODEL']['backbone_out_c']*config['MODEL']['bottleneck'][0]*config['MODEL']['bottleneck'][1]
-                * config['MODEL']['bottleneck'][2], config['MODEL']['classifier_in']),
-        )
-
         if not config['MODEL']['pretrained']:
             self.model.apply(self.weights_init)
 
-        self.flatten.apply(self.weights_init)
+        if self.config['MODEL']['backbone'] not in ['simpleCNN', 'simpleCNNBackbone', 'efficientnet']:
+            self.flatten = nn.Sequential(
+                nn.Dropout(config['MODEL']['dropout_prob']),
+                nn.AdaptiveAvgPool3d(output_size=config['MODEL']['bottleneck']),
+                nn.Flatten(),
+                nn.Dropout(config['MODEL']['dropout_prob']),
+                nn.Linear(
+                    config['MODEL']['backbone_out_c'] * config['MODEL']['bottleneck'][0] *
+                    config['MODEL']['bottleneck'][1]
+                    * config['MODEL']['bottleneck'][2], config['MODEL']['classifier_in']),
+            )
+            self.flatten.apply(self.weights_init)
+            self.model = nn.Sequential(self.model, self.flatten)
 
     def forward(self, x):
-        return (self.flatten(self.model(x))
-                if self.config['MODEL']['backbone'] not in ['simpleCNN', 'efficientnet'] else self.model(x))
+        return self.model(x)
 
-    @staticmethod
-    def weights_init(m):
+    def weights_init(self, m):
         if isinstance(m, nn.Conv3d) or isinstance(m, nn.Linear):
-            nn.init.xavier_uniform_(m.weight.data)
+            if self.w_init == 'xavier':
+                nn.init.xavier_uniform_(m.weight.data)
+            elif self.w_init == 'kaiming':
+                nn.init.kaiming_uniform_(m.weight.data)
 
     @staticmethod
     def add_channels_to_ts(model, in_channels):
@@ -147,17 +147,17 @@ class Classifier(LightningModule):
 class EfficientNetBN(nets.EfficientNet):
 
     def __init__(
-        self,
-        model_name: str,
-        pretrained: bool = True,
-        progress: bool = True,
-        spatial_dims: int = 2,
-        in_channels: int = 3,
-        num_classes: int = 1000,
-        norm = ("batch", {"eps": 1e-3, "momentum": 0.01}),
-        adv_prop: bool = False,
-        dropout_rate: float = None,
-        dropconnect_rate: float = None,
+            self,
+            model_name: str,
+            pretrained: bool = True,
+            progress: bool = True,
+            spatial_dims: int = 2,
+            in_channels: int = 3,
+            num_classes: int = 1000,
+            norm=("batch", {"eps": 1e-3, "momentum": 0.01}),
+            adv_prop: bool = False,
+            dropout_rate: float = None,
+            dropconnect_rate: float = None,
     ) -> None:
         """
         Generic wrapper around EfficientNet, used to initialize EfficientNet-B0 to EfficientNet-B7 models
@@ -212,7 +212,8 @@ class EfficientNetBN(nets.EfficientNet):
             raise ValueError(f"invalid model_name {model_name} found, must be one of {model_name_string} ")
 
         # get network parameters
-        weight_coeff, depth_coeff, image_size, dropout_rate_st, dropconnect_rate_st = efficientnet_params[model_name]
+        weight_coeff, depth_coeff, image_size, dropout_rate_st, dropconnect_rate_st = efficientnet_params[
+            model_name]
 
         # create model and initialize random weights
         super().__init__(
@@ -232,7 +233,6 @@ class EfficientNetBN(nets.EfficientNet):
         if pretrained and (spatial_dims == 2):
             _load_state_dict(self, model_name, progress, adv_prop)
 
-
 efficientnet_params = {
     # model_name: (width_mult, depth_mult, image_size, dropout_rate, dropconnect_rate)
     "efficientnet-b0": (1.0, 1.0, 224, 0.2, 0.2),
@@ -246,7 +246,6 @@ efficientnet_params = {
     "efficientnet-b8": (2.2, 3.6, 672, 0.5, 0.2),
     "efficientnet-l2": (4.3, 5.3, 800, 0.5, 0.2),
 }
-
 
 url_map = {
     "efficientnet-b0": "https://github.com/lukemelas/EfficientNet-PyTorch/releases/download/1.0/efficientnet-b0-355c32eb.pth",
@@ -268,7 +267,6 @@ url_map = {
     "b7-ap": "https://github.com/lukemelas/EfficientNet-PyTorch/releases/download/1.0/adv-efficientnet-b7-4652b6dd.pth",
     "b8-ap": "https://github.com/lukemelas/EfficientNet-PyTorch/releases/download/1.0/adv-efficientnet-b8-22a8fe65.pth",
 }
-
 
 def _load_state_dict(model: nn.Module, arch: str, progress: bool, adv_prop: bool) -> None:
     if adv_prop:

@@ -81,7 +81,7 @@ def save_mid_slices_for_batch(
         for i in range(B):
             lbl_raw = get_label(slabels, i)
             lbl = slug(lbl_raw)
-            base = f"{tag}_s{i}_{lbl}_{ch_name}"
+            base = f"{tag}_{lbl}_{ch_name}"  # f"{tag}_s{i}_{lbl}_{ch_name}"
 
             # Planes (names chosen to reflect axis index in the tensor)
             # mid-Z equivalent -> along dim 2 (D1)
@@ -108,15 +108,19 @@ def save_mid_slices_for_batch(
 
     ct_list   = _one_channel_paths("CT",   0)
     dose_list = _one_channel_paths("DOSE", 1)
-    return ct_list, dose_list
+    if C == 3:
+        struct_list = _one_channel_paths("STRUCT", 2)
+    else:
+        struct_list = None
+    return ct_list, dose_list, struct_list
 
 
 def test_loss_computation(prediction, label, event, lf):
     if lf[0] == 'CoxPHLoss':
         lf = CoxPHLoss(mode='implemented', reduction='none')
-        loss = lf.forward(prediction, label, event)
+        loss = lf.forward(prediction.detach(), label.detach(), event.detach())
         return loss
     else:
         lf = getattr(torch.nn, lf[0])(reduction='none')
-        loss = lf(prediction, label)
+        loss = lf(prediction.detach(), label.detach())
         return loss

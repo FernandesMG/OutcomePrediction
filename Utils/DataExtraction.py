@@ -5,6 +5,7 @@ from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import IterativeImputer, SimpleImputer
 from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
 
+
 def create_subject_list(config):
     patients = pd.read_csv(config['DATA']['patient_ids_file_path'])['PatientID']
     data_columns = config['DATA']['clinical_cols'] + [config['DATA']['target']] + config['DATA']['additional_targets']
@@ -17,7 +18,7 @@ def create_subject_list(config):
     patient_paths = [Path(config['DATA']['data_folder']) / subject_list.loc[pat, 'PatientPathSuffix']
                      for pat in patients if pat in subject_list.index]
     subject_list = subject_list.loc[subject_list.index.isin(patients), data_columns]
-    subject_list = subject_list.loc[[p.stem for p in patient_paths], data_columns]
+    subject_list = subject_list.loc[[p.stem for p in patient_paths]]
     # Certify censored value is 0 and event 1
     if 'censor_label' in config['DATA'].keys() and 'censored_value' in config['DATA'].keys():
         subject_list['Censored'] = (
@@ -30,7 +31,8 @@ def create_subject_list(config):
 
     # Add each patient's modality paths
     for modality in config['MODALITY']:
-        if config['MODALITY'][modality]:
+        if config['MODALITY'][modality] or (
+                'reconstruction_target' in config['DATA'] and modality in config['DATA']['reconstruction_target']):
             filename = config['DATA'][f'{modality}_path']
             subject_list[f'{modality}_Path'] = [pat / filename for pat in patient_paths]
 
@@ -65,6 +67,7 @@ def create_subject_list(config):
             new_categorical_cols += cols
         config['DATA']['given_categorical_cols'] = config['DATA']['categorical_cols']
         config['DATA']['given_clinical_cols'] = config['DATA']['clinical_cols']
+        config['DATA']['continuous_cols'] = [col for col in config['DATA']['clinical_cols'] if col not in config['DATA']['categorical_cols']]
         config['DATA']['categorical_cols'] = new_categorical_cols
         config['DATA']['clinical_cols'] = config['DATA']['continuous_cols'] + config['DATA']['categorical_cols']
 

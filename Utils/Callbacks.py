@@ -100,7 +100,9 @@ def get_callbacks(config):
         save_top_k=1,
         mode='min')
     checkpoint_callback_main_target = ModelCheckpoint(
-        monitor="validation_mae_epoch" if config['MODEL']['modes'][0] == 'regression' else 'validation_auc_epoch',
+        monitor="validation_mae_epoch" if ((type(config['MODEL']['modes']) is list
+                                           and config['MODEL']['modes'][0] == 'regression')
+                                           or config['MODEL']['modes'] == 'regression') else 'validation_auc_epoch',
         filename=f"{{model_name}}-epoch{{epoch:02d}}_best_main_target",
         save_top_k=1,
         mode='min' if config['MODEL']['modes'][0] == 'regression' else 'max')
