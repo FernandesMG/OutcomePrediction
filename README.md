@@ -1,0 +1,1 @@
+Dynamic outcome prediction or reconstruction from multimodal inputs (CT, Dose, PET, Mask) with optional late fusion of tabular data. Model architecture and multiple other parameters are chosen using the .ini file. 
