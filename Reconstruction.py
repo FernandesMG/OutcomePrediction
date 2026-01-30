@@ -21,7 +21,9 @@ from Models.ResUnetImplemented import ResUNetImplemented
 from Utils.DataExtraction import create_subject_list
 from Utils.Transformations import reconstruction_transform_pipeline
 from Utils.Callbacks import get_callbacks
-from Utils.ProcessResults import inverse_transform_target, get_results_table, get_train_val_test_tab
+from Utils.ProcessResults import (get_train_val_test_tab, inverse_transform_dose_ct, save_results_images_to_disk,
+                                  compute_reconstruction_performance)
+
 
 ## Main
 import toml
@@ -108,8 +110,11 @@ def set_parameters(model, parameters):
     model.load_state_dict(state_dict, strict=True)
 
 
-def infer_and_save_results(ckpt_dict, log_dir, config, model, trainer, dataloader,
-                           ckpt_type: Literal['ckpt', 's_dict'] = 'ckpt', module_dict=None):
+def infer_and_save_results(ckpt_dict, log_dir, config, model, trainer, dataloader_getter,
+                           ckpt_type: Literal['ckpt', 's_dict'] = 'ckpt', module_dict=None, save_images=False,
+                           inference_only=False):
+    dataloader_getter.kwargs['inference'] = inference_only
+    dataloader = dataloader_getter()
     assert ckpt_type in ['ckpt', 's_dict']
     for ckpt_key in ckpt_dict:
         checkpoint_path = ckpt_dict[ckpt_key]
@@ -122,9 +127,20 @@ def infer_and_save_results(ckpt_dict, log_dir, config, model, trainer, dataloade
             best_model = deepcopy(model)
             best_model.load_state_dict(best_model_state_dict)
         results = trainer.predict(best_model, dataloader)
-        results_table = get_results_table(results, dataloader, config)
-        results_table = inverse_transform_target(results_table, dataloader, config)
-        results_table.to_csv(Path(log_dir) / f'results_{ckpt_key}.csv')
+        results_predictions = torch.cat([result[0] for result in results], dim=0)
+        pat_ids = sum([result[2] for result in results], [])
+        results_transformed, cts, doses = inverse_transform_dose_ct(results_predictions, dataloader, config)
+        if not inference_only:
+            targets = torch.cat([result[1] for result in results], dim=0)
+            target_transformed, _, _ = inverse_transform_dose_ct(targets, dataloader, config)
+            results_table = compute_reconstruction_performance(results_predictions, target_transformed, pat_ids,
+                                                               dataloader, config)
+            results_table.to_csv(Path(log_dir) / f'results_{ckpt_key}.csv')
+        if save_images:
+            if cts is not None:
+                save_results_images_to_disk(cts, pat_ids, 'CT', Path(log_dir), dataloader)
+            if doses is not None:
+                save_results_images_to_disk(doses, pat_ids, 'RTDOSE', Path(log_dir), dataloader)
 
 
 def fit(trainer_getter, dataloader_getter, model):

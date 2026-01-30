@@ -28,7 +28,6 @@ class Classifier(LightningModule):
         assert self.w_init in ['xavier', 'kaiming']
         self.backbone_fixed = config['MODEL']['backbone_fixed']
         model = config['MODEL']['backbone']
-        parameters = config['MODEL_PARAMETERS']
 
         # only use network for features
         if model == 'torchvision':

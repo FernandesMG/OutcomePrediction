@@ -50,7 +50,8 @@ class MixModel(LightningModule):
             self.head = nn.Identity()
         elif config['MODEL']['backbone'] == 'simpleCNNBackbone':
             self.head = nn.Sequential()
-            fused_dim = config['MODEL']['backbone_out_c'] + config['MODEL']['tab_config'][-1]
+            tab_out = config['MODEL']['tab_config'][-1] if ('RECORDS' in config and config['RECORDS']['records']) else 0
+            fused_dim = config['MODEL']['backbone_out_c'] + tab_out
             layers = ([fused_dim] + config['MODEL']['head_config'] + [config['DATA']['n_classes']])
             for i in range(len(layers) - 1):
                 self.head += nn.Sequential(
@@ -187,10 +188,11 @@ class MixModel(LightningModule):
                      prog_bar=False)
         elif self.survival_prediction_mode == 'regression':
             self.log('train_mae_epoch', self.train_mae, on_step=False, on_epoch=True, sync_dist=True,
-                     prog_bar=True)
+                     prog_bar=False)
             self.log("train_mape_epoch", self.train_mape, on_step=False, on_epoch=True, sync_dist=True,
                      prog_bar=False)
-            self.log('train_c_index_epoch', self.train_c_index, on_step=False, on_epoch=True, sync_dist=True)
+            self.log('train_c_index_epoch', self.train_c_index, on_step=False, on_epoch=True, sync_dist=True,
+                     prog_bar=True)
 
     def validation_step(self, batch, batch_idx):
         data_dict, label, event = self.get_data_label_event(batch)
@@ -226,11 +228,11 @@ class MixModel(LightningModule):
                      sync_dist=True, prog_bar=False)
         elif self.survival_prediction_mode == 'regression':
             self.log('validation_mae_epoch', self.validation_mae, on_step=False, on_epoch=True,
-                     sync_dist=True, prog_bar=True)
+                     sync_dist=True, prog_bar=False)
             self.log('validation_mape_epoch', self.validation_mape, on_step=False, on_epoch=True, sync_dist=True,
                      prog_bar=False)
             self.log('validation_c_index_epoch', self.validation_c_index, on_step=False, on_epoch=True,
-                     sync_dist=True)
+                     sync_dist=True, prog_bar=True)
 
     def test_step(self, batch, batch_idx):
         data_dict, label, event = self.get_data_label_event(batch)

@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 from pathlib import Path
+from typing import Any, Optional
 from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import IterativeImputer, SimpleImputer
 from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
@@ -58,22 +59,88 @@ def create_subject_list(config):
 
     if 'RECORDS' in config.keys() and config['RECORDS']['records'] and 'categorical_cols' in config['DATA']:
         subject_list_old = subject_list.copy()
-        subject_list = pd.get_dummies(subject_list, columns=config['DATA']['categorical_cols'], drop_first=True,
-                                      dtype=np.float32)
-        new_categorical_cols = []
-        for var in config['DATA']['categorical_cols']:
-            cols = [c for c in list(subject_list.columns) if var in c]
-            subject_list.loc[subject_list_old[var].isna(), cols] = np.nan
-            new_categorical_cols += cols
-        config['DATA']['given_categorical_cols'] = config['DATA']['categorical_cols']
-        config['DATA']['given_clinical_cols'] = config['DATA']['clinical_cols']
-        config['DATA']['continuous_cols'] = [col for col in config['DATA']['clinical_cols'] if col not in config['DATA']['categorical_cols']]
-        config['DATA']['categorical_cols'] = new_categorical_cols
-        config['DATA']['clinical_cols'] = config['DATA']['continuous_cols'] + config['DATA']['categorical_cols']
+        if config['DATA']['one_hot_enc']:
+            subject_list = pd.get_dummies(subject_list, columns=config['DATA']['categorical_cols'], drop_first=True,
+                                          dtype=np.float32)
+            new_categorical_cols = []
+            for var in config['DATA']['categorical_cols']:
+                cols = [c for c in list(subject_list.columns) if var in c]
+                subject_list.loc[subject_list_old[var].isna(), cols] = np.nan
+                new_categorical_cols += cols
+            config['DATA']['given_categorical_cols'] = config['DATA']['categorical_cols']
+            config['DATA']['given_clinical_cols'] = config['DATA']['clinical_cols']
+            config['DATA']['continuous_cols'] = [col for col in config['DATA']['clinical_cols'] if col not in config['DATA']['categorical_cols']]
+            config['DATA']['categorical_cols'] = new_categorical_cols
+            config['DATA']['clinical_cols'] = config['DATA']['continuous_cols'] + config['DATA']['categorical_cols']
+        else:
+            config['DATA']['given_categorical_cols'] = config['DATA']['categorical_cols']
+            config['DATA']['given_clinical_cols'] = config['DATA']['clinical_cols']
+            config['DATA']['continuous_cols'] = [col for col in config['DATA']['clinical_cols'] if
+                                                 col not in config['DATA']['categorical_cols']]
+            config['DATA']['clinical_cols'] = config['DATA']['continuous_cols'] + config['DATA']['categorical_cols']
 
     if config['DATA']['imputation'] == 'mice' and len(config['DATA']['clinical_cols']) > 0:
         imputer = IterativeImputer()
         subject_list.loc[:, config['DATA']['clinical_cols']] = imputer.fit_transform(
             subject_list.loc[:, config['DATA']['clinical_cols']]).astype(np.float32)
+    elif config['DATA']['imputation'] == 'none':
+        cardinalities = eval(config['DATA']['cat_cardinalities'])
+        for col in config['DATA']['categorical_cols']:
+            subject_list.loc[:, col] = add_missing_as_category(subject_list[col], cardinalities[col])
 
     return subject_list.reset_index()
+
+
+def add_missing_as_category(
+    values: pd.Series,
+    cardinality: Optional[int] = None,
+) -> pd.Series:
+    """
+    Replace missing values in an int-coded categorical variable with a new category,
+    using 0 as the code for missing and shifting all existing category codes up by 1.
+
+    Parameters
+    ----------
+    values : pandas Series
+        Input data: pandas Series.
+        Values should be integer codes (possibly with missing values).
+
+    cardinality : int, optional
+        Expected total number of categories NOT INCLUDING the missing category.
+        If provided, this function will check that all resulting codes are
+        strictly less than `cardinality` and raise an error otherwise.
+
+        This is typically the value you would pass to `num_embeddings` in a
+        PyTorch `nn.Embedding` (i.e. max index + 1).
+
+    Returns
+    -------
+    pandas Series
+        The input with:
+        - missing values coded as 0
+        - all original non-missing codes increased by 1
+    """
+    ser = values.copy()
+    missing_mask = ser.isna()
+    non_missing_mask = ~missing_mask
+
+    # Optional consistency check if cardinality is provided
+    if cardinality is not None:
+        max_code = int(ser.max())
+        if max_code >= cardinality:
+            raise ValueError(
+                f"Resulting codes go up to {max_code}, which is incompatible "
+                f"with cardinality={cardinality}."
+            )
+
+    # Shift all existing (non-missing) category codes up by 1
+    if non_missing_mask.any():
+        ser.loc[non_missing_mask] = ser.loc[non_missing_mask].astype("int64") + 1
+
+    # Assign 0 to missing values
+    ser.loc[missing_mask] = 0
+
+    # No missing values left, so we can safely use an integer dtype
+    ser = ser.astype("int64")
+
+    return ser

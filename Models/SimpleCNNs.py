@@ -80,12 +80,11 @@ class CNN(pl.LightningModule):
 # ---------- ResUNet3D using residual backbone style ----------
 class ResUNet3D(nn.Module):
     """
-    A small, fast ResUNet-like 3D segmenter.
+    A small, fast ResUNet-like 3D classifier/regressor.
     Depth: 3 downs / 3 ups. Channels: 8-16-32 (match your backbone).
     Returns logits of shape [B, out_classes, D, H, W].
     """
-    def __init__(self, in_channels, out_classes, base=(8,16,32), groups=8,
-                 drop_path_max=0.1, anisotropic=False):
+    def __init__(self, in_channels, out_classes, base=(8,16,32), groups=8, drop_path_max=0.1, anisotropic=False):
         super().__init__()
         c1, c2, c3 = base
 
@@ -94,7 +93,7 @@ class ResUNet3D(nn.Module):
         self.stem = nn.Sequential(
             nn.Conv3d(in_channels, c1, kernel_size=3, padding=1, bias=False),
             nn.GroupNorm(g1, c1),
-            nn.SiLU(inplace=True),
+            nn.SiLU(inplace=False),
         )
 
         # Encoder (down)
@@ -110,6 +109,83 @@ class ResUNet3D(nn.Module):
         s0 = self.stem(x)
 
         b, e1, e2, e3 = self.encoder(x)
+
+        logits = self.decoder(b, e2, e1, s0)  # [B, C, D, H, W]
+
+        return logits
+
+
+class ResUNet3DWTabInput(ResUNet3D):
+    """
+    A small, fast ResUNet-like 3D classifier/regressor which modifies one of its input channels using external tabular
+    variables. Modification is made by creating new uniform channels with the specified tabular variables.
+    Depth: 3 downs / 3 ups. Channels: 8-16-32 (match your backbone).
+    Returns logits of shape [B, out_classes, D, H, W].
+    """
+    def __init__(self, in_channels, out_classes, base=(8,16,32), groups=8, drop_path_max=0.1, anisotropic=False,
+                 tab_vars=2, modified_channel_idx=0):
+        super().__init__(in_channels, out_classes, base, groups, drop_path_max, anisotropic)
+        self.modified_channel_idx = modified_channel_idx
+        c1, c2, c3 = base
+
+        g1 = math.gcd(groups, c1) or 1
+        self.channel_mod = nn.Sequential(
+            nn.Conv3d(tab_vars+1, c1, kernel_size=1, padding=1, bias=False),
+            nn.GroupNorm(g1, c1),
+            nn.SiLU(inplace=False),
+            nn.Conv3d(c1, 1, kernel_size=1, padding=1, bias=True),
+        )
+
+    def forward(self, x, tab_vars):
+        # expand tab vars to image shape
+        expanded_tab = tab_vars[:, :, None, None, None] * torch.ones([tab_vars[0], tab_vars[1]] + list(x.shape[2:]))
+
+        # generate new modified channel
+        modified_channel = self.channel_mod(torch.cat([expanded_tab, x[:, self.modified_channel_idx]], dim=1))
+
+        # substitute original channel by modified channel
+        x[:, self.modified_channel_idx] = modified_channel
+
+        # full-res skip
+        s0 = self.stem(x)
+
+        b, e1, e2, e3 = self.encoder(x)
+
+        logits = self.decoder(b, e2, e1, s0)  # [B, C, D, H, W]
+
+        return logits
+
+
+class ResUNet3DWLateFusion(ResUNet3D):
+    """
+    A small, fast ResUNet-like 3D classifier/regressor which fuses external tabular variables between the encoder and
+    the decoder. Modification is made by creating new uniform channels with the specified tabular variables.
+    Depth: 3 downs / 3 ups. Channels: 8-16-32 (match your backbone).
+    Returns logits of shape [B, out_classes, D, H, W].
+    """
+    def __init__(self, in_channels, out_classes, base=(8,16,32), groups=8, drop_path_max=0.1, anisotropic=False,
+                 tab_vars=2, modified_channel_idx=0):
+        super().__init__(in_channels, out_classes, base, groups, drop_path_max, anisotropic)
+        self.modified_channel_idx = modified_channel_idx
+        c1, c2, c3 = base
+
+        new_base = (c1, c2, c3+tab_vars)
+
+        # Decoder (up + fuse)
+        self.decoder = ResUNet3DDecoder(out_classes, new_base, groups, drop_path_max)
+
+    def forward(self, x, tab_vars):
+        # full-res skip
+        s0 = self.stem(x)
+
+        b, e1, e2, e3 = self.encoder(x)
+
+        # expand tab vars to image shape
+        expanded_tab = tab_vars[:, :, None, None, None] * torch.ones(
+            [tab_vars.shape[0], tab_vars.shape[1]] + list(b.shape[2:]), device=tab_vars.device, dtype=x.dtype)
+
+        # generate new modified channel
+        b = torch.cat([expanded_tab, b], dim=1)
 
         logits = self.decoder(b, e2, e1, s0)  # [B, C, D, H, W]
 
@@ -180,7 +256,7 @@ class ResUNet3DDecoder(nn.Module):
         self.up0  = UpFuse(in_ch=c1, skip_ch=c1, out_ch=c1, groups=groups, p_drop=sched[2])
         self.up0_ = ResBlock3D(c1, c1, stride=1, groups=groups, p_drop=sched[2])
 
-        # Segmentation head
+        # Classification/Regression head
         self.head = nn.Conv3d(c1, out_classes, kernel_size=1, bias=True)
 
     def forward(self, x, e2, e1, s0):
@@ -242,7 +318,6 @@ class SimpleCNNTest(pl.LightningModule):
 
     def forward(self, x):
         return self.flatten(self.model(x))
-
 
 class SimpleCNNTest2(pl.LightningModule):
     def __init__(self, in_channels, out_classes, config):

@@ -15,7 +15,7 @@ from pytorch_lightning.profilers import SimpleProfiler, AdvancedProfiler, PyTorc
 ## Module - Dataloaders
 from DataGenerator.DataGenerator import DataModule
 from Models.Classifier import Classifier
-from Models.MLPs import TabMLP
+from Models.MLPs import TabMLP, TabCatContEncoder
 from Models.MixModel import MixModel
 from Utils.DataExtraction import create_subject_list
 from Utils.Transformations import transform_pipeline
@@ -86,10 +86,18 @@ def build_model(config):
                     module_dict.pop('RTSTRUCT')
 
     if 'RECORDS' in config.keys() and config['RECORDS']['records']:
-        module_dict['records'] = TabMLP(len(clinical_cols), config['MODEL']['tab_config'],
-                                        p=config['MODEL']['dropout_prob_tab'])
-        # module_dict['records'] = Linear(config, in_feat=len(clinical_cols),
-        #                                 out_feat=config['MODEL']['linear_out']
+        if config['MODEL']['tab_encoder'] == 'TabMLP':
+            module_dict['records'] = TabMLP(len(clinical_cols), config['MODEL']['tab_config'],
+                                            p=config['MODEL']['dropout_prob_tab'])
+        elif config['MODEL']['tab_encoder'] == 'TabCatContEncoder':
+            card_dict = eval(config['DATA']['cat_cardinalities'])
+            cardinalities = [card_dict[elem] for elem in config['DATA']['categorical_cols']]
+            n_continuous = len(clinical_cols) - len(config['DATA']['categorical_cols'])
+            params = eval(config['MODEL']['tab_encoder_params'])
+            module_dict['records'] = TabCatContEncoder(n_continuous, cardinalities,
+                                                       out_hidden=config['MODEL']['tab_config'], **params)
+        else:
+            raise NotImplementedError(f'Not implemented for tab_encoder "{config["MODEL"]["tab_encoder"]}"')
     return module_dict
 
 
@@ -109,19 +117,25 @@ def set_parameters(model, parameters):
     model.load_state_dict(state_dict, strict=True)
 
 
+def load_model(checkpoint_path, log_dir, model, ckpt_type: Literal['ckpt', 's_dict'] = 'ckpt', config=None,
+               module_dict=None):
+    h_param_path = Path(log_dir) / 'hparams.yaml'
+    if ckpt_type == 'ckpt':
+        best_model = model.__class__.load_from_checkpoint(checkpoint_path, hparams_file=h_param_path,
+                                                          module_dict=module_dict, config=config)
+    elif ckpt_type == 's_dict':
+        best_model_state_dict = torch.load(checkpoint_path)['state_dict']
+        best_model = deepcopy(model)
+        best_model.load_state_dict(best_model_state_dict)
+    return best_model
+
+
 def infer_and_save_results(ckpt_dict, log_dir, config, model, trainer, dataloader,
                            ckpt_type: Literal['ckpt', 's_dict'] = 'ckpt', module_dict=None):
     assert ckpt_type in ['ckpt', 's_dict']
     for ckpt_key in ckpt_dict:
         checkpoint_path = ckpt_dict[ckpt_key]
-        h_param_path = Path(log_dir) / 'hparams.yaml'
-        if ckpt_type == 'ckpt':
-            best_model = model.__class__.load_from_checkpoint(checkpoint_path, hparams_file=h_param_path,
-                                                              module_dict=module_dict, config=config)
-        elif ckpt_type == 's_dict':
-            best_model_state_dict = torch.load(checkpoint_path)['state_dict']
-            best_model = deepcopy(model)
-            best_model.load_state_dict(best_model_state_dict)
+        best_model = load_model(checkpoint_path, log_dir, model, ckpt_type, config, module_dict)
         results = trainer.predict(best_model, dataloader)
         results_table = get_results_table(results, dataloader, config)
         results_table = inverse_transform_target(results_table, dataloader, config)

@@ -29,7 +29,7 @@ class ResBlock3D(nn.Module):
 
         self.conv1 = nn.Conv3d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False)
         self.gn1   = nn.GroupNorm(g_out, out_ch)
-        self.act   = nn.SiLU(inplace=True)
+        self.act   = nn.SiLU(inplace=False)
         self.conv2 = nn.Conv3d(out_ch, out_ch, 3, padding=1, bias=False)
         self.gn2   = nn.GroupNorm(g_out, out_ch)
 
@@ -38,7 +38,7 @@ class ResBlock3D(nn.Module):
             mid = max(8, out_ch // 8)
             self.se = nn.Sequential(
                 nn.AdaptiveAvgPool3d(1),
-                nn.Conv3d(out_ch, mid, 1), nn.SiLU(inplace=True),
+                nn.Conv3d(out_ch, mid, 1), nn.SiLU(inplace=False),
                 nn.Conv3d(mid, out_ch, 1), nn.Sigmoid()
             )
 
@@ -85,12 +85,12 @@ class UpFuse(nn.Module):
     """
     Upsamples 'x' to match spatial size of 'skip', aligns channels, concatenates, then fuses with a ResBlock.
     """
-    def __init__(self, in_ch, skip_ch, out_ch, groups=8, drop_path=0.0):
+    def __init__(self, in_ch, skip_ch, out_ch, groups=8, p_drop=0.0):
         super().__init__()
         # 1x1 to align channels after upsampling (optional but neat)
         self.proj = nn.Conv3d(in_ch, skip_ch, kernel_size=1, bias=False)
         self.fuse = ResBlock3D(in_ch=skip_ch + skip_ch, out_ch=out_ch, stride=1,
-                               groups=groups, se=False, drop_path=drop_path)
+                               groups=groups, se=False, p_drop=p_drop)
 
     def forward(self, x, skip):
         # upsample x to skip spatial size

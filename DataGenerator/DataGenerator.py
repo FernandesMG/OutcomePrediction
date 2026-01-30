@@ -1,22 +1,14 @@
 from pytorch_lightning import LightningDataModule, LightningModule, Trainer, seed_everything
-from pytorch_lightning.utilities.types import EVAL_DATALOADERS
 from torch.utils.data import DataLoader, RandomSampler
 import numpy as np
 import torch
+import torch.multiprocessing as mp
 from sklearn.model_selection import train_test_split, StratifiedShuffleSplit, KFold
 import pandas as pd
-from sklearn.preprocessing import OneHotEncoder, MinMaxScaler, LabelEncoder, OrdinalEncoder
-from sklearn.compose import ColumnTransformer
 from pathlib import Path
-from collections import Counter
-from monai.visualize.utils import matshow3d
-from monai.transforms import LoadImage, EnsureChannelFirstd, ResampleToMatchd, ResizeWithPadOrCropd
-from monai.data.meta_tensor import MetaTensor
+from monai.transforms import LoadImage
 from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
-from copy import deepcopy
 import time
-import SimpleITK as sitk
-import nibabel as nib
 import random
 
 
@@ -49,6 +41,15 @@ class DataGenerator(torch.utils.data.Dataset):
         self.predict = predict
         self.n = 0
         self.times = []
+        self.ct_loader = (LoadImage(image_only=True, reader='ITKReader')
+                          if 'CT' in self.keys and self.config['MODALITY']['CT'] else None)
+        self.dose_loader = (LoadImage(image_only=True, reader='ITKReader')
+                            if 'RTDOSE' in self.keys and self.config['MODALITY']['RTDOSE'] else None)
+        self.pet_loader = (LoadImage(image_only=True, reader='ITKReader')
+                           if 'PET' in self.keys and self.config['MODALITY']['PET'] else None)
+        self.mask_loader = (LoadImage(image_only=True, reader='ITKReader')
+                            if 'RTSTRUCT' in self.keys and self.config['MODALITY']['RTSTRUCT'] else None)
+        # self.TEST_IMG = LoadImage(image_only=True)(r'/home/ganbit/data/Nifty_Data/UCLH_NSCLC/00001/CT.nii.gz')
 
     def __len__(self):
         return int(self.SubjectList.shape[0])
@@ -61,34 +62,42 @@ class DataGenerator(torch.utils.data.Dataset):
         if 'CT' in self.keys and self.config['MODALITY']['CT']:
             CTPath = self.SubjectList.loc[i, 'CT_Path']
             CT_Path = Path(CTPath, 'CT.nii.gz')
-            data['CT'] = LoadImage(image_only=True, reader='ITKReader')(CT_Path)
+            data['CT'] = self.ct_loader(CT_Path)
 
         ## Load RTDOSE
         if 'RTDOSE' in self.keys and self.config['MODALITY']['RTDOSE']:
             RTDOSEPath = self.SubjectList.loc[i, 'RTDOSE_Path']
             RTDOSEPath = Path(RTDOSEPath, 'Dose.nii.gz')
-            data['RTDOSE'] = LoadImage(image_only=True)(RTDOSEPath)
+            data['RTDOSE'] = self.dose_loader(RTDOSEPath)
 
         ## Load PET
         if 'PET' in self.keys and self.config['MODALITY']['PET']:
             PETPath = self.SubjectList.loc[i, 'PET_Path']
             if self.config['DATA']['Nifty']:
                 PETPath = Path(PETPath, 'pet.nii.gz')
-            data['PET'] = LoadImage(image_only=True)(PETPath)
+            data['PET'] = self.pet_loader(PETPath)
 
         ## Load Mask
         if 'RTSTRUCT' in self.keys and self.config['MODALITY']['RTSTRUCT']:
             RSPath = self.SubjectList.loc[i, 'RTSTRUCT_Path']
             RS_Path = Path(RSPath, self.config['DATA']['structs'] + '.nii.gz')
-            data['RTSTRUCT'] = LoadImage(image_only=True)(RS_Path)
+            data['RTSTRUCT'] = self.mask_loader(RS_Path)
             data['RTSTRUCT'][data['RTSTRUCT'] > 0] += 3
 
         # Add clinical record at the end
         if 'RECORDS' in self.config.keys() and self.config['RECORDS']['records']:
-            data['records'] = self.SubjectList.loc[i, self.clinical_cols].values.astype('float')
+            data['records'] = self.SubjectList.loc[i, self.clinical_cols].values.astype(np.float32)
 
         if self.transform:
+            # start = time.perf_counter()
             data = self.transform(data)
+            # end = time.perf_counter()
+            # elapsed_time = end - start
+            # self.times.append(elapsed_time)
+            # self.n += 1
+            # if self.n % 100 == 0:
+            #     print(f"Average execution `transform_pipeline` time over {len(self.times)} runs: {np.average(self.times):.1f} seconds")
+            #     self.times = []
 
         if self.config['DATA']['multichannel']:
             old_keys = list(self.keys)
@@ -133,6 +142,14 @@ class DataGeneratorReconstruction(torch.utils.data.Dataset):
         self.predict = predict
         self.n = 0
         self.times = []
+        self.ct_loader = (LoadImage(image_only=True, reader='ITKReader')
+                          if 'CT' in self.keys or ('CT' in self.label_keys and not self.inference) else None)
+        self.dose_loader = (LoadImage(image_only=True, reader='ITKReader')
+                            if 'RTDOSE' in self.keys or ('RTDOSE' in self.label_keys and not self.inference) else None)
+        self.pet_loader = (LoadImage(image_only=True, reader='ITKReader')
+                           if 'PET' in self.keys or ('PET' in self.label_keys and not self.inference) else None)
+        self.mask_loader = (LoadImage(image_only=True, reader='ITKReader')
+                            if 'RTSTRUCT' in self.keys or ('RTSTRUCT' in self.label_keys and not self.inference) else None)
 
     def __len__(self):
         return int(self.SubjectList.shape[0])
@@ -141,41 +158,40 @@ class DataGeneratorReconstruction(torch.utils.data.Dataset):
         data = {}
         data['slabel'] = self.SubjectList.loc[i, self.config['DATA']['subject_label']]
         ## Load CT
-        if 'CT' in self.keys or 'CT' in self.label_keys:
+        if 'CT' in self.keys or ('CT' in self.label_keys and not self.inference):
             CTPath = self.SubjectList.loc[i, 'CT_Path']
             CT_Path = Path(CTPath, 'CT.nii.gz')
-            ct = LoadImage(image_only=True, reader='ITKReader')(CT_Path)
+            ct = self.ct_loader(CT_Path)
             if 'CT' in self.keys:
                 data['CT'] = ct
             if 'CT' in self.label_keys:
                 data['CT_target'] = ct
 
         ## Load RTDOSE
-        if 'RTDOSE' in self.keys or 'RTDOSE' in self.label_keys:
+        if 'RTDOSE' in self.keys or ('RTDOSE' in self.label_keys and not self.inference):
             RTDOSEPath = self.SubjectList.loc[i, 'RTDOSE_Path']
             RTDOSEPath = Path(RTDOSEPath, 'Dose.nii.gz')
-            dose = LoadImage(image_only=True)(RTDOSEPath)
+            dose = self.dose_loader(RTDOSEPath)
             if 'RTDOSE' in self.keys:
                 data['RTDOSE'] = dose
             if 'RTDOSE' in self.label_keys:
                 data['RTDOSE_target'] = dose
 
         ## Load PET
-        if 'PET' in self.keys or 'PET' in self.label_keys:
+        if 'PET' in self.keys or ('PET' in self.label_keys and not self.inference):
             PETPath = self.SubjectList.loc[i, 'PET_Path']
-            if self.config['DATA']['Nifty']:
-                PETPath = Path(PETPath, 'pet.nii.gz')
-            pet = LoadImage(image_only=True)(PETPath)
+            PETPath = Path(PETPath, 'pet.nii.gz')
+            pet = self.pet_loader(PETPath)
             if 'PET' in self.keys:
                 data['PET'] = pet
             if 'PET' in self.label_keys:
                 data['PET_target'] = pet
 
         ## Load Mask
-        if 'RTSTRUCT' in self.keys or 'RTSTRUCT' in self.label_keys:
+        if 'RTSTRUCT' in self.keys or ('RTSTRUCT' in self.label_keys and not self.inference):
             RSPath = self.SubjectList.loc[i, 'RTSTRUCT_Path']
             RS_Path = Path(RSPath, self.config['DATA']['structs'] + '.nii.gz')
-            struct = LoadImage(image_only=True)(RS_Path)
+            struct = self.mask_loader(RS_Path)
             struct[struct>0] = 1
             if 'RTSTRUCT' in self.keys:
                 data['RTSTRUCT'] = struct
@@ -184,8 +200,8 @@ class DataGeneratorReconstruction(torch.utils.data.Dataset):
 
         # Add clinical record at the end
         if ('RECORDS' in self.config.keys() and self.config['RECORDS']['records']) or 'RECORDS' in self.label_keys:
-            records = self.SubjectList.loc[i, self.clinical_cols].values.astype('float')
-            if 'RECORDS' in self.keys:
+            records = self.SubjectList.loc[i, self.clinical_cols].values.astype(np.float32)
+            if self.config['RECORDS']['records']:
                 data['records'] = records
             if 'RECORDS' in self.label_keys:
                 data['records_target'] = records
@@ -194,14 +210,12 @@ class DataGeneratorReconstruction(torch.utils.data.Dataset):
             data = self.transform(data)
 
         data['Image'] = np.concatenate([data[key] for key in self.keys], axis=0)
-        label = np.concatenate([data[f'{key}_target'] for key in self.label_keys], axis=0)
-        for key in self.keys+[f'{k}_target' for k in self.label_keys]:
+        label = np.concatenate([data[f'{key}_target'] for key in self.label_keys], axis=0) if not self.inference else np.nan
+        keys_to_pop = self.keys+[f'{k}_target' for k in self.label_keys] if not self.inference else self.keys
+        for key in keys_to_pop:
             data.pop(key)
 
-        if self.inference:
-            return data
-        else:
-            return data, label
+        return data, label
 
 
 # DataLoader
@@ -218,6 +232,8 @@ class DataModule(LightningDataModule):
         self.generator = torch.Generator()
         self.generator.manual_seed(int(self.rd_worker))
         self.train_fraction = train_fraction
+        self.train_transform = train_transform
+        self.val_transform = val_transform
 
         train_list, val_list, test_list = self.get_train_val_test(
             config, rd, train_size, SubjectList, train_fraction, split_list)
@@ -250,20 +266,25 @@ class DataModule(LightningDataModule):
         self.train_sampler = RandomSampler(self.train_data, generator=self.generator)
 
     def train_dataloader(self):
-        return DataLoader(self.train_data, batch_size=self.batch_size,
-                          num_workers=self.num_workers, pin_memory=True, sampler=self.train_sampler)
+        ctx = mp.get_context("spawn")
+        return DataLoader(self.train_data, batch_size=self.batch_size, multiprocessing_context=ctx,
+                          num_workers=self.num_workers, pin_memory=True, sampler=self.train_sampler,
+                          persistent_workers=True)
 
     def val_dataloader(self):
-        return DataLoader(self.val_data, batch_size=self.batch_size,
-                          num_workers=self.num_workers, pin_memory=True, shuffle=False)
+        ctx = mp.get_context("spawn")
+        return DataLoader(self.val_data, batch_size=self.batch_size, multiprocessing_context=ctx,
+                          num_workers=self.num_workers, pin_memory=True, shuffle=False, persistent_workers=True)
 
     def test_dataloader(self):
-        return DataLoader(self.test_data, batch_size=self.batch_size,
-                          num_workers=self.num_workers, pin_memory=True, shuffle=False)
+        ctx = mp.get_context("spawn")
+        return DataLoader(self.test_data, batch_size=self.batch_size, multiprocessing_context=ctx,
+                          num_workers=self.num_workers, pin_memory=True, shuffle=False, persistent_workers=True)
 
     def predict_dataloader(self):
-        return DataLoader(self.full_data, batch_size=self.batch_size,
-                          num_workers=self.num_workers, pin_memory=True, shuffle=False)
+        ctx = mp.get_context("spawn")
+        return DataLoader(self.full_data, batch_size=self.batch_size, multiprocessing_context=ctx,
+                          num_workers=self.num_workers, pin_memory=True, shuffle=False, persistent_workers=True)
 
     def get_train_val_test(self, config, rd, train_size, subject_list, train_fraction=1., split_list=None):
         if split_list is not None:
@@ -295,8 +316,8 @@ class DataModule(LightningDataModule):
     @staticmethod
     def _random_split_(subject_list, train_size, rd):
         train_list, val_test_list = train_test_split(subject_list, train_size=train_size, random_state=rd)  ## 0.7/0.3
-        # val_list, test_list = train_test_split(val_test_list, train_size=0.5, random_state=rd)  ## 0.15/0.15  TODO: TRAIN SIZE IS TO BE PUT BACK TO 0.5!!!
-        val_list, test_list = val_test_list, val_test_list
+        # val_list, test_list = train_test_split(val_test_list, train_size=0.5, random_state=rd) ## 0.15/0.15  TODO: TRAIN SIZE IS TO BE PUT BACK TO 0.5!!!
+        val_list, test_list = val_test_list, val_test_list  # added
         return train_list, val_list, test_list
 
     @staticmethod

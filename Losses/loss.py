@@ -147,33 +147,40 @@ def grad3d(t):
 
 
 class GradientDiffLoss(torch.nn.Module):
-    def __init__(self, p=1):  # p=1 -> L1 on gradients
-        super().__init__(); self.p = p
+    def __init__(self, p=1, reduction='mean'):  # p=1 -> L1 on gradients
+        super().__init__()
+        self.p = p
+        self.reduction = reduction
+        assert reduction in ['mean', 'none']
 
     def forward(self, x, y, mask=None):
-        gz = grad3d(x); gy = grad3d(y)
+        gz = grad3d(x)
+        gy = grad3d(y)
         diffs = [a - b for a, b in zip(gz, gy)]
         if mask is not None:
             m_z = mask[..., 1:, :, :]; m_y = mask[..., :, 1:, :]; m_x = mask[..., :, :, 1:]
             diffs = [d * m for d, m in zip(diffs, (m_z, m_y, m_x))]
         if self.p == 1:
-            vals = sum(d.abs().mean() for d in diffs)
+            vals = (sum(d.abs().mean() for d in diffs)
+                    if self.reduction == 'mean' else sum(d.abs().mean(axis=[-3, -2, -1]) for d in diffs))
         else:
-            vals = sum((d**2).mean() for d in diffs)
+            vals = (sum((d**2).mean() for d in diffs)
+                    if self.reduction == 'mean' else sum((d**2).mean(axis=[-3, -2, -1]) for d in diffs))
         return vals / 3.0
 
 
 class ComboLoss(torch.nn.Module):
-    def __init__(self, w_l1=1.0, w_ssim=0.1, w_gdl=0.1):
+    def __init__(self, w_l1=1.0, w_ssim=0.1, w_gdl=0.1, reduction='mean'):
         super().__init__()
-        self.l1 = torch.nn.L1Loss()
-        self.ssim = SSIMLoss(spatial_dims=3, win_size=7)
-        self.gdl = GradientDiffLoss(p=1)
+        self.l1 = torch.nn.L1Loss(reduction=reduction)
+        self.ssim = SSIMLoss(spatial_dims=3, win_size=7, reduction=reduction)
+        self.gdl = GradientDiffLoss(p=1, reduction=reduction)
         self.w_l1, self.w_ssim, self.w_gdl = w_l1, w_ssim, w_gdl
+        self.reduction = reduction
 
     def forward(self, pred, tgt, mask=None):
-        loss = self.w_l1 * (torch.mean(torch.abs((pred - tgt) * (mask if mask is not None else 1.0))))
-        loss += self.w_ssim * self.ssim(pred, tgt)
-        loss += self.w_gdl * self.gdl(pred, tgt, mask)
+        loss = self.w_l1 * (self.l1(pred, tgt) * (mask if mask is not None else 1.0))
+        loss += self.w_ssim * (self.ssim(pred, tgt) * (mask if mask is not None else 1.0))[:, :, None, None, None]
+        loss += self.w_gdl * self.gdl(pred, tgt, mask)[:, :, None, None, None]
         return loss
 

@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# Tabular encoder (continuous-only version). Add cat embeddings if needed.
+# Tabular encoder (continuous-only version)
 class TabMLP(nn.Module):
     def __init__(self, in_dim, hid=(64, 32), p=0.1):
         super().__init__()
@@ -21,26 +21,26 @@ class TabMLP(nn.Module):
 
 
 # ---------- Mixed tabular encoder (continuous + categorical) ----------
-class TabEncoder(nn.Module):
+class TabCatContEncoder(nn.Module):
     """
     x_cont: [B, num_cont] float (already standardized if possible)
     x_cat:  [B, num_cat]  long  (0..card_i; where 0 = UNK/other)
     """
     def __init__(self, num_cont, cat_cardinalities, emb_dropout=0.1,
-                 cont_mlp_hidden=(32,), out_hidden=(64, 32)):
+                 cont_mlp_hidden=(32,), out_hidden=(64, 32), embedding_dims=None, padding_idx=0):
         super().__init__()
         self.num_cont = num_cont
-        self.num_cat  = len(cat_cardinalities)
+        self.num_cat = len(cat_cardinalities)
 
         # per-feature embedding dims
         def emb_dim(card):
-            return int(min(32, max(4, round(1.6 * (card ** 0.56)))))
+            return int(min(32, max(2, round(1.6 * (card ** 0.56)))))
 
         self.embs = nn.ModuleList([
             nn.Embedding(num_embeddings=card + 1,  # +1 for UNK id=0
-                         embedding_dim=emb_dim(card),
-                         padding_idx=0)
-            for card in cat_cardinalities
+                         embedding_dim=embedding_dims[i] if embedding_dims is not None else emb_dim(card),
+                         padding_idx=padding_idx)
+            for i, card in enumerate(cat_cardinalities)
         ])
         self.emb_dropout = nn.Dropout(emb_dropout)
         cat_dim = sum(e.embedding_dim for e in self.embs)
@@ -63,7 +63,9 @@ class TabEncoder(nn.Module):
         self.proj = nn.Sequential(*layers)
         self.out_dim = d
 
-    def forward(self, x_cont, x_cat):
+    def forward(self, x):
+        x_cont = x[:, :self.num_cont]
+        x_cat = x[:, self.num_cont:].to(torch.long)
         # cat: embed each column and concat
         if self.num_cat > 0:
             cat_vecs = [emb(x_cat[:, i]) for i, emb in enumerate(self.embs)]
