@@ -1,1 +1,9 @@
-/Logs/
+# Python
+__pycache__/
+*.py[cod]
+
+# PyCharm / IntelliJ
+.idea/
+
+# Logs / outputs (optional)
+Logs/
